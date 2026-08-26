@@ -6,10 +6,14 @@ defmodule MastercardSimulator.Router do
     PUT  /api/rest/version/:v/merchant/:mid/order/:oid/transaction/:tid
     GET  /api/rest/version/:v/merchant/:mid/order/:oid/transaction/:tid
     GET  /api/rest/version/:v/merchant/:mid/order/:oid
+    POST /api/rest/version/:v/merchant/:mid/session
+    PUT  /api/rest/version/:v/merchant/:mid/session/:sid
     GET  /admin/transactions
 
   Public routes (no auth):
     GET  /health
+    GET  /static/checkout/checkout.min.js
+    GET  /form/version/:v/merchant/:mid/session.js
   """
 
   use Plug.Router
@@ -47,6 +51,18 @@ defmodule MastercardSimulator.Router do
       version: "77",
       time:    DateTime.to_iso8601(DateTime.utc_now())
     })
+  end
+
+  # ── MPGS browser-loaded scripts (no auth — see AuthPlug) ─────────────────────
+
+  # GET  /static/checkout/checkout.min.js
+  get "/static/checkout/checkout.min.js" do
+    send_js(conn, checkout_js())
+  end
+
+  # GET  /form/version/:api_version/merchant/:merchant_id/session.js
+  get "/form/version/:_api_version/merchant/:_merchant_id/session.js" do
+    send_js(conn, session_js())
   end
 
   # ── MPGS Transaction API ──────────────────────────────────────────────────────
@@ -103,6 +119,21 @@ defmodule MastercardSimulator.Router do
     })
   end
 
+  # PUT  /api/rest/version/:api_version/merchant/:merchant_id/session/:session_id
+  put "/api/rest/version/:_api_version/merchant/:_merchant_id/session/:session_id" do
+    body = conn.body_params || %{}
+
+    Logger.info("Session update request for session: #{session_id}, body: #{inspect(body)}")
+
+    send_json(conn, 200, %{
+      "result" => "SUCCESS",
+      "session" => %{
+        "id" => session_id,
+        "version" => "1"
+      }
+    })
+  end
+
   # ── Admin endpoint ────────────────────────────────────────────────────────────
 
   # GET  /admin/transactions   (useful for debugging / test verification)
@@ -148,5 +179,124 @@ defmodule MastercardSimulator.Router do
     conn
     |> put_resp_header("content-type", "application/json")
     |> send_resp(status, Jason.encode!(body))
+  end
+
+  defp send_js(conn, body) do
+    conn
+    |> put_resp_header("content-type", "application/javascript")
+    |> send_resp(200, body)
+  end
+
+  # ── Mock MPGS browser scripts ────────────────────────────────────────────────
+
+  defp checkout_js do
+    """
+    (function () {
+      window.Checkout = {
+        _config: null,
+
+        configure: function (options) {
+          this._config = options || {};
+          console.log("[MPGS Simulator] Checkout.configure", this._config);
+        },
+
+        showEmbeddedPage: function (selector) {
+          var el = document.querySelector(selector);
+          if (!el) {
+            console.warn("[MPGS Simulator] showEmbeddedPage: no element for selector", selector);
+            return;
+          }
+
+          var sessionId =
+            (this._config && this._config.session && this._config.session.id) || "UNKNOWN_SESSION";
+
+          el.innerHTML =
+            '<div style="border:1px solid #ccc;padding:16px;font-family:sans-serif;">' +
+            "<p><strong>MPGS Simulator &mdash; Embedded Payment Form</strong></p>" +
+            "<p>Session: " + sessionId + "</p>" +
+            '<label>Card Number <input id="mpgs-card-number" type="text" placeholder="4111111111111111"></label><br>' +
+            '<label>Expiry Month <input id="mpgs-expiry-month" type="text" placeholder="12"></label>' +
+            '<label>Expiry Year <input id="mpgs-expiry-year" type="text" placeholder="2030"></label><br>' +
+            '<label>CVV <input id="mpgs-security-code" type="text" placeholder="123"></label>' +
+            "</div>";
+        },
+
+        showPaymentPage: function () {
+          console.log("[MPGS Simulator] Checkout.showPaymentPage", this._config);
+        }
+      };
+    })();
+    """
+  end
+
+  defp session_js do
+    """
+    (function () {
+      var FIELD_SPECS = {
+        number:       { inputmode: "numeric", maxlength: 19, autocomplete: "cc-number",   errorKey: "cardNumber" },
+        securityCode: { inputmode: "numeric", maxlength: 4,  autocomplete: "cc-csc",      errorKey: "securityCode" },
+        expiryMonth:  { inputmode: "numeric", maxlength: 2,  autocomplete: "cc-exp-month", errorKey: "expiryMonth" },
+        expiryYear:   { inputmode: "numeric", maxlength: 4,  autocomplete: "cc-exp-year",  errorKey: "expiryYear" }
+      };
+
+      window.PaymentSession = {
+        _config: null,
+        _inputs: {},
+
+        configure: function (options) {
+          this._config = options || {};
+          this._inputs = {};
+          console.log("[MPGS Simulator] PaymentSession.configure", this._config);
+
+          var fields = (this._config.fields && this._config.fields.card) || {};
+
+          for (var name in fields) {
+            if (!Object.prototype.hasOwnProperty.call(fields, name)) continue;
+
+            var selector = fields[name];
+            var container = document.querySelector(selector);
+            if (!container) {
+              console.warn("[MPGS Simulator] session.js: no element for selector", selector);
+              continue;
+            }
+
+            var spec = FIELD_SPECS[name] || {};
+            var input = document.createElement("input");
+            input.type = "text";
+            input.setAttribute("data-mpgs-field", name);
+            if (spec.inputmode) input.setAttribute("inputmode", spec.inputmode);
+            if (spec.maxlength) input.setAttribute("maxlength", spec.maxlength);
+            if (spec.autocomplete) input.setAttribute("autocomplete", spec.autocomplete);
+
+            container.innerHTML = "";
+            container.appendChild(input);
+            this._inputs[name] = input;
+          }
+
+          if (this._config.callbacks && typeof this._config.callbacks.initialized === "function") {
+            this._config.callbacks.initialized({ status: "ok" });
+          }
+        },
+
+        updateSessionFromForm: function (type) {
+          console.log("[MPGS Simulator] PaymentSession.updateSessionFromForm", type);
+
+          var callback =
+            this._config && this._config.callbacks && this._config.callbacks.formSessionUpdate;
+          if (typeof callback !== "function") return;
+
+          var cardNumberInput = this._inputs.number;
+          var cardNumber = cardNumberInput ? cardNumberInput.value.trim() : "";
+
+          if (!cardNumber) {
+            callback({ status: "fields_in_error", errors: { cardNumber: true } });
+            return;
+          }
+
+          callback({ status: "ok" });
+        }
+      };
+    })();
+    """
   end
 end

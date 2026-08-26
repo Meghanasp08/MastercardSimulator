@@ -1,7 +1,8 @@
 defmodule MastercardSimulator.AuthPlug do
   @moduledoc """
   HTTP Basic Auth middleware for the MPGS simulator.
-  Paths in @public_paths bypass authentication entirely.
+  Paths in @public_paths, plus the browser-loaded MPGS script routes,
+  bypass authentication entirely.
   Credentials are compared in constant time to prevent timing attacks.
   """
 
@@ -11,22 +12,41 @@ defmodule MastercardSimulator.AuthPlug do
   @behaviour Plug
 
   # Paths that do NOT require authentication
-  @public_paths ["/health"]
+  @public_paths ["/health", "/static/checkout/checkout.min.js"]
 
   @impl Plug
   def init(opts), do: opts
 
   @impl Plug
-  def call(%{request_path: path} = conn, _opts) when path in @public_paths, do: conn
+  def call(%{request_path: path} = conn, _opts) do
+    if public_path?(path) do
+      conn
+    else
+      authenticate(conn)
+    end
+  end
 
-  def call(conn, _opts) do
+  # ── Private ──────────────────────────────────────────────────────────────────
+
+  defp authenticate(conn) do
     case get_req_header(conn, "authorization") do
       ["Basic " <> encoded] -> validate_basic(conn, encoded)
       _                     -> unauthorized(conn)
     end
   end
 
-  # ── Private ──────────────────────────────────────────────────────────────────
+  defp public_path?(path) do
+    path in @public_paths or session_js_path?(path)
+  end
+
+  # GET /form/version/:version/merchant/:merchant_id/session.js is loaded
+  # directly by the browser and must be reachable without credentials.
+  defp session_js_path?(path) do
+    case String.split(path, "/", trim: true) do
+      ["form", "version", _version, "merchant", _merchant_id, "session.js"] -> true
+      _ -> false
+    end
+  end
 
   defp validate_basic(conn, encoded) do
     with {:ok, decoded}             <- Base.decode64(encoded),
