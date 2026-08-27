@@ -8,6 +8,7 @@ defmodule MastercardSimulator.Application do
 
     children = [
       MastercardSimulator.TransactionStore,
+      MastercardSimulator.ThreeDSStore,
       {Bandit, plug: MastercardSimulator.Router, port: port, scheme: :http}
     ]
 

@@ -18,6 +18,11 @@ defmodule MastercardSimulator.AuthPlug do
   def init(opts), do: opts
 
   @impl Plug
+  # CORS preflight requests never carry the merchant's Basic Auth credentials
+  # (browsers don't attach them to an OPTIONS preflight), so they must always
+  # be allowed through — the real request behind them still gets checked.
+  def call(%{method: "OPTIONS"} = conn, _opts), do: conn
+
   def call(%{request_path: path} = conn, _opts) do
     if public_path?(path) do
       conn
@@ -36,7 +41,8 @@ defmodule MastercardSimulator.AuthPlug do
   end
 
   defp public_path?(path) do
-    path in @public_paths or session_js_path?(path)
+    path in @public_paths or session_js_path?(path) or session_card_path?(path) or
+      acs_path?(path) or three_ds2_challenge_path?(path)
   end
 
   # GET /form/version/:version/merchant/:merchant_id/session.js is loaded
@@ -44,6 +50,36 @@ defmodule MastercardSimulator.AuthPlug do
   defp session_js_path?(path) do
     case String.split(path, "/", trim: true) do
       ["form", "version", _version, "merchant", _merchant_id, "session.js"] -> true
+      _ -> false
+    end
+  end
+
+  # POST .../session/:id/card — session.js's own browser-side AJAX call that
+  # attaches card data to the session; the cardholder's browser calls this
+  # directly, so it can't carry the merchant's Basic Auth credentials.
+  defp session_card_path?(path) do
+    case String.split(path, "/", trim: true) do
+      ["form", "version", _version, "merchant", _merchant_id, "session", _session_id, "card"] -> true
+      _ -> false
+    end
+  end
+
+  # POST /acs/:challenge_id[/verify] — the simulated 3DS1 ACS challenge page,
+  # hit directly by the cardholder's browser after an auto-post redirect.
+  defp acs_path?(path) do
+    case String.split(path, "/", trim: true) do
+      ["acs", _challenge_id] -> true
+      ["acs", _challenge_id, "verify"] -> true
+      _ -> false
+    end
+  end
+
+  # GET/POST /3ds2/challenge/:auth_id[/verify] — the simulated 3DS2 hosted
+  # challenge page opened by session.js in an iframe overlay.
+  defp three_ds2_challenge_path?(path) do
+    case String.split(path, "/", trim: true) do
+      ["3ds2", "challenge", _auth_id] -> true
+      ["3ds2", "challenge", _auth_id, "verify"] -> true
       _ -> false
     end
   end

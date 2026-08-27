@@ -7,12 +7,12 @@ defmodule MastercardSimulator.TransactionHandler do
   """
 
   require Logger
-  alias MastercardSimulator.{TransactionStore, ScenarioEngine, ResponseBuilder}
+  alias MastercardSimulator.{TransactionStore, ScenarioEngine, ResponseBuilder, ThreeDSStore, ThreeDSEngine}
 
   # ── Entry points ─────────────────────────────────────────────────────────────
 
   @doc "Handle a PUT (create/update) transaction request."
-  def handle(merchant_id, order_id, transaction_id, body) do
+  def handle(merchant_id, order_id, transaction_id, body, base_url \\ "http://localhost") do
     operation = Map.get(body, "apiOperation", "PAY")
 
     Logger.info(
@@ -35,6 +35,9 @@ defmodule MastercardSimulator.TransactionHandler do
 
       "VERIFY" ->
         handle_verify(merchant_id, order_id, transaction_id, body)
+
+      "CHECK_3DS_ENROLLMENT" ->
+        handle_check_3ds_enrollment(merchant_id, order_id, transaction_id, body, base_url)
 
       unknown ->
         error = %{
@@ -234,7 +237,51 @@ defmodule MastercardSimulator.TransactionHandler do
     {:ok, 200, response}
   end
 
+  defp handle_check_3ds_enrollment(merchant_id, order_id, transaction_id, body, base_url) do
+    card     = get_in(body, ["sourceOfFunds", "provided", "card"]) || %{}
+    pan      = extract_pan(card, Map.get(card, "track2", ""))
+    order    = Map.get(body, "order", %{})
+    amount   = Map.get(order, "amount", 0)
+    currency = Map.get(order, "currency", "USD")
+
+    if ThreeDSEngine.enrolled?(pan) do
+      challenge_id = random_id()
+
+      ThreeDSStore.put("challenge:" <> challenge_id, %{
+        merchant_id:    merchant_id,
+        order_id:       order_id,
+        transaction_id: transaction_id,
+        amount:         amount,
+        currency:       currency,
+        status:         :pending
+      })
+
+      response = ResponseBuilder.three_ds_enrolled(challenge_id, order_id, transaction_id, amount, currency, base_url)
+      {:ok, 200, response}
+    else
+      {:ok, 200, ResponseBuilder.three_ds_not_enrolled()}
+    end
+  end
+
+  @doc "Handle POST .../3DSecureId/:id — decode the ACS PaRes and report the outcome."
+  def process_acs_result(three_ds_id, body) do
+    pa_res = get_in(body, ["3DSecure", "paRes"])
+    outcome = ThreeDSEngine.decode_result(pa_res)
+
+    case ThreeDSStore.get("challenge:" <> three_ds_id) do
+      {:ok, ctx} -> ThreeDSStore.merge("challenge:" <> three_ds_id, Map.put(ctx, :status, outcome))
+      {:error, :not_found} -> :ok
+    end
+
+    {:ok, 200, ResponseBuilder.acs_result(outcome)}
+  end
+
   # ── Helpers ──────────────────────────────────────────────────────────────────
+
+  defp random_id do
+    :crypto.strong_rand_bytes(12) |> Base.url_encode64(padding: false)
+  end
+
 
   defp store(order_id, transaction_id, params, response, status) do
     TransactionStore.put(order_id, transaction_id, %{

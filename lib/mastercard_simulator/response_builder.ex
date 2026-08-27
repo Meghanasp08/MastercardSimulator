@@ -272,6 +272,56 @@ defmodule MastercardSimulator.ResponseBuilder do
     }
   end
 
+  @doc "CHECK_3DS_ENROLLMENT response for an enrolled (challenge-required) card."
+  def three_ds_enrolled(challenge_id, order_id, transaction_id, amount, currency, base_url) do
+    pa_req =
+      %{"orderId" => order_id, "transactionId" => transaction_id, "amount" => amount, "currency" => currency}
+      |> Jason.encode!()
+      |> Base.encode64()
+
+    %{
+      "result"  => "SUCCESS",
+      "version" => "77",
+      "response" => %{"gatewayRecommendation" => "REQUIRE_3DS_CHALLENGE"},
+      "3DSecure" => %{
+        "veresEnrolled" => "Y",
+        "authenticationRedirect" => %{
+          "acsUrl" => "#{base_url}/acs/#{challenge_id}",
+          "paReq"  => pa_req
+        }
+      }
+    }
+  end
+
+  @doc "CHECK_3DS_ENROLLMENT response for a non-enrolled (frictionless) card."
+  def three_ds_not_enrolled do
+    %{
+      "result"  => "SUCCESS",
+      "version" => "77",
+      "response" => %{"gatewayRecommendation" => "PROCEED"},
+      "3DSecure" => %{"veresEnrolled" => "N"}
+    }
+  end
+
+  @doc "PROCESS_ACS_RESULT response for a decoded :pass/:fail ACS outcome."
+  def acs_result(:pass) do
+    %{
+      "result"  => "SUCCESS",
+      "version" => "77",
+      "response" => %{"gatewayCode" => "APPROVED", "gatewayRecommendation" => "PROCEED"},
+      "3DSecure" => %{"summaryStatus" => "AUTHENTICATION_SUCCESSFUL"}
+    }
+  end
+
+  def acs_result(:fail) do
+    %{
+      "result"  => "SUCCESS",
+      "version" => "77",
+      "response" => %{"gatewayCode" => "DECLINED", "gatewayRecommendation" => "DO_NOT_PROCEED"},
+      "3DSecure" => %{"summaryStatus" => "AUTHENTICATION_FAILED"}
+    }
+  end
+
   @doc "401 auth-error response body."
   def auth_error do
     %{
