@@ -19,7 +19,6 @@ defmodule MastercardSimulator.ResponseBuilder do
       scheme: scheme,
       expiry_month: expiry_month,
       expiry_year: expiry_year,
-      emv_request: emv_request,
       pos_terminal: pos_terminal
     } = params
 
@@ -64,14 +63,11 @@ defmodule MastercardSimulator.ResponseBuilder do
         "provided" => %{
           "card" => %{
             "brand"            => scheme,
-            "emvRequest"       => emv_request || %{},
-            "emvResponse"      => sample_emv_response(),
             "expiry"           => %{"month" => expiry_month || "12", "year" => expiry_year || "27"},
             "fundingMethod"    => "DEBIT",
             "number"           => mask_pan(pan),
             "scheme"           => scheme,
-            "storedOnFile"     => "NOT_STORED",
-            "trackDataProvided" => true
+            "storedOnFile"     => "NOT_STORED"
           }
         },
         "type" => "CARD"
@@ -94,9 +90,9 @@ defmodule MastercardSimulator.ResponseBuilder do
         "currency"             => currency,
         "id"                   => transaction_id,
         "receipt"              => "SIM#{stan}",
-        "source"               => "CARD_PRESENT",
+        "source"               => "CARD_NOT_PRESENT",
         "stan"                 => stan,
-        "terminal"             => "SIM001",
+        "terminal"             => "SIMULATOR_ECOM",
         "type"                 => transaction_type(operation)
       },
       "version" => "77"
@@ -142,7 +138,7 @@ defmodule MastercardSimulator.ResponseBuilder do
         "amount"   => parse_amount(amount),
         "currency" => currency,
         "id"       => transaction_id,
-        "source"   => "CARD_PRESENT",
+        "source"   => "CARD_NOT_PRESENT",
         "type"     => transaction_type(operation)
       },
       "version" => "77"
@@ -169,7 +165,7 @@ defmodule MastercardSimulator.ResponseBuilder do
       "timeOfRecord"     => DateTime.to_iso8601(now),
       "transaction" => %{
         "id"     => transaction_id,
-        "source" => "CARD_PRESENT"
+        "source" => "CARD_NOT_PRESENT"
       },
       "version" => "77"
     }
@@ -208,7 +204,7 @@ defmodule MastercardSimulator.ResponseBuilder do
       "timeOfRecord"     => DateTime.to_iso8601(now),
       "transaction" => %{
         "id"     => transaction_id,
-        "source" => "CARD_PRESENT",
+        "source" => "CARD_NOT_PRESENT",
         "type"   => "VOID"
       },
       "version" => "77"
@@ -253,7 +249,7 @@ defmodule MastercardSimulator.ResponseBuilder do
         "authorizationCode" => auth_code,
         "currency"          => currency,
         "id"                => transaction_id,
-        "source"            => "CARD_PRESENT",
+        "source"            => "CARD_NOT_PRESENT",
         "type"              => "REFUND"
       },
       "version" => "77"
@@ -339,23 +335,20 @@ defmodule MastercardSimulator.ResponseBuilder do
   defp transaction_type("VERIFY"),    do: "VERIFICATION"
   defp transaction_type(_),           do: "PAYMENT"
 
-  defp sample_emv_response do
-    %{
-      "72" => "9F180408041215860E04DA9F5809030691D72E6F027DC6",
-      "91" => "B7D5309D4B3E6CDB3030"
-    }
-  end
-
   defp echo_pos_terminal(nil), do: %{}
 
+  # This simulator only serves the web-services / hosted-session /
+  # hosted-checkout flow (see gatewayEntryPoint: "WEB_SERVICES_API" above) —
+  # there is no card-present/POS path, so absent fields must default to
+  # card-not-present, e-commerce values rather than physical-terminal ones.
   defp echo_pos_terminal(pos) do
     %{
-      "attended"              => Map.get(pos, "attended", "ATTENDED"),
-      "cardPresenceCapability" => Map.get(pos, "cardPresenceCapability", "CARD_PRESENT"),
-      "cardholderActivated"   => Map.get(pos, "cardholderActivated", "NOT_CARDHOLDER_ACTIVATED"),
-      "inputCapability"       => Map.get(pos, "inputCapability", "CONTACTLESS_CHIP"),
-      "location"              => Map.get(pos, "location", "MERCHANT_TERMINAL_ON_PREMISES"),
-      "panEntryMode"          => Map.get(pos, "panEntryMode", "CONTACTLESS")
+      "attended"               => Map.get(pos, "attended", "NOT_ATTENDED"),
+      "cardPresenceCapability" => Map.get(pos, "cardPresenceCapability", "CARD_NOT_PRESENT"),
+      "cardholderActivated"    => Map.get(pos, "cardholderActivated", "NOT_CARDHOLDER_ACTIVATED"),
+      "inputCapability"        => Map.get(pos, "inputCapability", "UNSPECIFIED"),
+      "location"               => Map.get(pos, "location", "MERCHANT_TERMINAL_NOT_APPLICABLE"),
+      "panEntryMode"           => Map.get(pos, "panEntryMode", "MANUAL_KEY_ENTRY")
     }
   end
 
