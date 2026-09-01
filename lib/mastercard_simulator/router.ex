@@ -555,6 +555,12 @@ defmodule MastercardSimulator.Router do
 
     result_indicator =
       if order_id && merchant_id do
+        # The 3DS challenge was shown and passed — record it against the
+        # order so the PAY this flow runs next reports
+        # AUTHENTICATION_SUCCESSFUL instead of AUTHENTICATION_NOT_IN_EFFECT
+        # (same order3ds:<id> state the Hosted Session flow uses).
+        ThreeDSStore.put("order3ds:" <> order_id, %{stage: :authenticated, outcome: :pass})
+
         case run_checkout_payment(order_id, merchant_id, context, card, base_url) do
           {:approved, _response} -> success_indicator
           {:declined, _response} -> nil
