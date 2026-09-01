@@ -450,21 +450,25 @@ defmodule MastercardSimulator.TransactionHandler do
       <meta name="viewport" content="width=device-width, initial-scale=1">
       <title>Identity Verification</title>
       <style>
-        body { font-family: Arial, Helvetica, sans-serif; background: #eef1f4; margin: 0; }
-        .card { max-width: 380px; margin: 40px auto; background: #fff; border-radius: 8px;
-                box-shadow: 0 4px 16px rgba(0,0,0,.15); overflow: hidden; }
-        .bank-header { background: #003a70; color: #fff; padding: 16px 20px; font-size: 14px;
+        *, *::before, *::after { box-sizing: border-box; }
+        body { font-family: Arial, Helvetica, sans-serif; background: transparent; margin: 0;
+               min-height: 100vh; display: flex; align-items: center; justify-content: center;
+               padding: 24px; }
+        .card { width: 100%; max-width: 500px; background: #fff; border-radius: 12px;
+                box-shadow: 0 10px 40px rgba(0,0,0,.18); overflow: hidden; }
+        .bank-header { background: #003a70; color: #fff; padding: 18px 28px; font-size: 14px;
                        font-weight: 600; letter-spacing: .3px; }
-        .body { padding: 24px; }
-        h1 { font-size: 18px; margin: 0 0 8px; color: #1a1a2e; }
-        p { font-size: 13px; color: #555; line-height: 1.5; }
-        input[type=text] { width: 100%; box-sizing: border-box; padding: 12px; font-size: 20px;
+        .body { padding: 28px 28px 24px; }
+        h1 { font-size: 19px; margin: 0 0 8px; color: #1a1a2e; }
+        p { font-size: 13px; color: #555; line-height: 1.6; margin: 0; }
+        input[type=text] { width: 100%; padding: 14px; font-size: 20px;
                             letter-spacing: 4px; text-align: center; border: 1.5px solid #ccd3da;
-                            border-radius: 6px; margin: 16px 0; }
-        button { width: 100%; padding: 12px; background: #003a70; color: #fff; border: 0;
-                 border-radius: 6px; font-size: 15px; font-weight: 600; cursor: pointer; }
-        .hint { font-size: 11px; color: #8a94a6; margin-top: 10px; text-align: center; }
-        .footer { padding: 12px 24px; font-size: 11px; color: #9aa4b2; text-align: center;
+                            border-radius: 8px; margin: 20px 0 4px; }
+        button { width: 100%; padding: 14px; background: #003a70; color: #fff; border: 0;
+                 border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer; }
+        .hint { font-size: 12px; color: #8a94a6; margin-top: 14px; text-align: center;
+                line-height: 1.5; }
+        .footer { padding: 14px 28px; font-size: 12px; color: #9aa4b2; text-align: center;
                   border-top: 1px solid #eef1f4; }
       </style>
     </head>
