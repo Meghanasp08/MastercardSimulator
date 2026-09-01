@@ -30,13 +30,18 @@ defmodule MastercardSimulator.ResponseBuilder do
     settlement_date   = Date.utc_today() |> Date.to_iso8601()
     amt               = parse_amount(amount)
 
+    # Defaults to AUTHENTICATION_NOT_IN_EFFECT for flows with no prior 3DS.
+    # A Hosted Session order that completed AUTHENTICATE_PAYER first passes
+    # the resolved status in (see TransactionHandler.authentication_status_for/1).
+    auth_status       = Map.get(params, :authentication_status, "AUTHENTICATION_NOT_IN_EFFECT")
+
     %{
       "apiOperation"     => operation,
       "gatewayEntryPoint" => "WEB_SERVICES_API",
       "merchant"         => merchant_id,
       "order" => %{
         "amount"                 => amt,
-        "authenticationStatus"   => "AUTHENTICATION_NOT_IN_EFFECT",
+        "authenticationStatus"   => auth_status,
         "chargeback"             => %{"amount" => 0, "currency" => currency},
         "creationTime"           => DateTime.to_iso8601(now),
         "currency"               => currency,
@@ -85,7 +90,7 @@ defmodule MastercardSimulator.ResponseBuilder do
           "transactionId"  => txn_identifier
         },
         "amount"               => amt,
-        "authenticationStatus" => "AUTHENTICATION_NOT_IN_EFFECT",
+        "authenticationStatus" => auth_status,
         "authorizationCode"    => auth_code,
         "currency"             => currency,
         "id"                   => transaction_id,

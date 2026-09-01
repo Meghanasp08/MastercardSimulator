@@ -3,7 +3,10 @@ defmodule MastercardSimulator.TransactionHandler do
   Dispatches each MPGS API operation to the correct handler and persists
   the result in the TransactionStore.
 
-  Supported operations: PAY, AUTHORIZE, CAPTURE, VOID, REFUND, VERIFY
+  Supported operations: PAY, AUTHORIZE, CAPTURE, VOID, REFUND, VERIFY,
+  CHECK_3DS_ENROLLMENT (3DS1), INITIATE_AUTHENTICATION / AUTHENTICATE_PAYER
+  (3DS2 for the Hosted Session integration — the merchant server drives the
+  challenge itself instead of session.js).
   """
 
   require Logger
@@ -38,6 +41,12 @@ defmodule MastercardSimulator.TransactionHandler do
 
       "CHECK_3DS_ENROLLMENT" ->
         handle_check_3ds_enrollment(merchant_id, order_id, transaction_id, body, base_url)
+
+      "INITIATE_AUTHENTICATION" ->
+        handle_initiate_authentication(order_id, transaction_id, body)
+
+      "AUTHENTICATE_PAYER" ->
+        handle_authenticate_payer(order_id, transaction_id, body, base_url)
 
       unknown ->
         error = %{
@@ -92,7 +101,8 @@ defmodule MastercardSimulator.TransactionHandler do
       expiry_month:  Map.get(expiry, "month"),
       expiry_year:   Map.get(expiry, "year"),
       emv_request:   emv_request,
-      pos_terminal:  pos_terminal
+      pos_terminal:  pos_terminal,
+      authentication_status: authentication_status_for(order_id)
     }
 
     outcome =
@@ -162,7 +172,8 @@ defmodule MastercardSimulator.TransactionHandler do
           expiry_month:   get_in(orig, [:params, :expiry_month]),
           expiry_year:    get_in(orig, [:params, :expiry_year]),
           emv_request:    %{},
-          pos_terminal:   %{}
+          pos_terminal:   %{},
+          authentication_status: authentication_status_for(order_id)
         }
 
         response = ResponseBuilder.approved(params)
@@ -276,7 +287,205 @@ defmodule MastercardSimulator.TransactionHandler do
     {:ok, 200, ResponseBuilder.acs_result(outcome)}
   end
 
+  # ── 3DS2 Hosted Session (merchant-server-driven) ─────────────────────────────
+  #
+  # For the Hosted Session integration session.js only tokenises the card; the
+  # merchant server then runs the challenge itself with two calls on the order
+  # transaction — INITIATE_AUTHENTICATION then AUTHENTICATE_PAYER — before it
+  # calls PAY/AUTHORIZE. State for the flow is kept under "order3ds:<order_id>"
+  # (one authentication per order) so the later PAY on the same order can echo
+  # the resolved authenticationStatus.
+
+  defp handle_initiate_authentication(order_id, transaction_id, body) do
+    session_id = get_in(body, ["session", "id"])
+    order      = Map.get(body, "order", %{})
+    amount     = Map.get(order, "amount", 0)
+    currency   = Map.get(order, "currency", "USD")
+
+    pan      = session_pan(session_id)
+    enrolled = is_nil(pan) or ThreeDSEngine.enrolled?(pan)
+
+    ThreeDSStore.put("order3ds:" <> order_id, %{
+      stage:          :initiated,
+      session_id:     session_id,
+      transaction_id: transaction_id,
+      amount:         amount,
+      currency:       currency,
+      pan:            pan,
+      enrolled:       enrolled
+    })
+
+    {:ok, 200, %{
+      "result"      => "SUCCESS",
+      "version"     => "77",
+      "transaction" => %{"id" => transaction_id},
+      "authentication" => %{
+        "version"           => "3DS2",
+        "transactionStatus" => if(enrolled, do: "C", else: "Y")
+      },
+      "response" => %{"gatewayRecommendation" => "PROCEED"}
+    }}
+  end
+
+  defp handle_authenticate_payer(order_id, transaction_id, body, base_url) do
+    redirect_response_url = get_in(body, ["authentication", "redirectResponseUrl"])
+    session_id            = get_in(body, ["session", "id"])
+
+    ctx =
+      case ThreeDSStore.get("order3ds:" <> order_id) do
+        {:ok, data} -> data
+        {:error, :not_found} -> %{}
+      end
+
+    pan      = Map.get(ctx, :pan) || session_pan(session_id)
+    enrolled = Map.get(ctx, :enrolled, is_nil(pan) or ThreeDSEngine.enrolled?(pan))
+
+    if enrolled do
+      auth_id = "AUTHPAYER_" <> (:crypto.strong_rand_bytes(9) |> Base.url_encode64(padding: false))
+
+      ThreeDSStore.merge("order3ds:" <> order_id, %{
+        stage:                 :pending_challenge,
+        transaction_id:        transaction_id,
+        redirect_response_url: redirect_response_url,
+        auth_id:               auth_id
+      })
+
+      ThreeDSStore.put("authpayer:" <> auth_id, %{order_id: order_id})
+
+      {:ok, 200, %{
+        "result"  => "SUCCESS",
+        "version" => "77",
+        "authentication" => %{
+          "version"      => "3DS2",
+          "redirectHtml" => authenticate_payer_redirect_html(auth_id, base_url)
+        },
+        "response" => %{"gatewayRecommendation" => "PROCEED"}
+      }}
+    else
+      # Frictionless test card — no challenge, merchant server pays immediately.
+      ThreeDSStore.merge("order3ds:" <> order_id, %{
+        stage:                 :authenticated,
+        transaction_id:        transaction_id,
+        outcome:               :pass,
+        redirect_response_url: redirect_response_url
+      })
+
+      {:ok, 200, %{
+        "result"  => "SUCCESS",
+        "version" => "77",
+        "authentication" => %{"version" => "3DS2", "transactionStatus" => "Y"},
+        "response" => %{"gatewayRecommendation" => "PROCEED"}
+      }}
+    end
+  end
+
+  @doc """
+  Finish an AUTHENTICATE_PAYER challenge: called by the OTP page embedded in
+  the `redirectHtml`. Records the outcome against the order and returns the
+  merchant `redirectResponseUrl` with the gateway recommendation appended, so
+  the caller can navigate the payer's browser back to the merchant.
+  """
+  def complete_authenticate_payer(auth_id, otp) do
+    with {:ok, %{order_id: order_id}} <- ThreeDSStore.get("authpayer:" <> auth_id),
+         {:ok, ctx}                   <- ThreeDSStore.get("order3ds:" <> order_id),
+         url when is_binary(url) and url != "" <- Map.get(ctx, :redirect_response_url) do
+      outcome =
+        case ThreeDSEngine.forced_challenge_outcome(Map.get(ctx, :pan)) do
+          nil    -> if ThreeDSEngine.valid_otp?(otp), do: :pass, else: :fail
+          forced -> forced
+        end
+
+      ThreeDSStore.merge("order3ds:" <> order_id, %{stage: :authenticated, outcome: outcome})
+
+      recommendation = if outcome == :pass, do: "PROCEED", else: "DO_NOT_PROCEED"
+      sep            = if String.contains?(url, "?"), do: "&", else: "?"
+
+      {:ok,
+       url <> sep <> "response_gatewayRecommendation=#{recommendation}" <>
+         "&authenticationTransactionId=#{auth_id}"}
+    else
+      _ -> {:error, :not_found}
+    end
+  end
+
   # ── Helpers ──────────────────────────────────────────────────────────────────
+
+  # Resolved 3DS2 status for a Hosted Session order that ran
+  # INITIATE_AUTHENTICATION / AUTHENTICATE_PAYER before this PAY/AUTHORIZE.
+  defp authentication_status_for(order_id) do
+    case ThreeDSStore.get("order3ds:" <> order_id) do
+      {:ok, %{stage: :authenticated, outcome: :pass}} -> "AUTHENTICATION_SUCCESSFUL"
+      {:ok, %{stage: :authenticated, outcome: :fail}} -> "AUTHENTICATION_FAILED"
+      _                                               -> "AUTHENTICATION_NOT_IN_EFFECT"
+    end
+  end
+
+  # The PAN tokenised into the session by session.js's updateSessionFromForm
+  # (POST .../session/:id/card), used to pick the 3DS2 test-card behaviour.
+  defp session_pan(nil), do: nil
+
+  defp session_pan(session_id) do
+    case ThreeDSStore.get("session:" <> session_id) do
+      {:ok, %{card: card}} when is_map(card) ->
+        pan = Map.get(card, "number") || Map.get(card, "pan")
+        if is_binary(pan) and pan != "", do: pan, else: nil
+
+      _ ->
+        nil
+    end
+  end
+
+  # A full, self-contained issuer-style OTP page returned verbatim to the
+  # payer's browser by the merchant server (AUTHENTICATE_PAYER.redirectHtml).
+  # Its form posts the OTP back to the simulator, which then navigates the
+  # browser to the merchant's redirectResponseUrl with the recommendation.
+  defp authenticate_payer_redirect_html(auth_id, base_url) do
+    action = "#{base_url}/3ds2/authenticate/#{auth_id}/verify"
+
+    """
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Identity Verification</title>
+      <style>
+        body { font-family: Arial, Helvetica, sans-serif; background: #eef1f4; margin: 0; }
+        .card { max-width: 380px; margin: 40px auto; background: #fff; border-radius: 8px;
+                box-shadow: 0 4px 16px rgba(0,0,0,.15); overflow: hidden; }
+        .bank-header { background: #003a70; color: #fff; padding: 16px 20px; font-size: 14px;
+                       font-weight: 600; letter-spacing: .3px; }
+        .body { padding: 24px; }
+        h1 { font-size: 18px; margin: 0 0 8px; color: #1a1a2e; }
+        p { font-size: 13px; color: #555; line-height: 1.5; }
+        input[type=text] { width: 100%; box-sizing: border-box; padding: 12px; font-size: 20px;
+                            letter-spacing: 4px; text-align: center; border: 1.5px solid #ccd3da;
+                            border-radius: 6px; margin: 16px 0; }
+        button { width: 100%; padding: 12px; background: #003a70; color: #fff; border: 0;
+                 border-radius: 6px; font-size: 15px; font-weight: 600; cursor: pointer; }
+        .hint { font-size: 11px; color: #8a94a6; margin-top: 10px; text-align: center; }
+        .footer { padding: 12px 24px; font-size: 11px; color: #9aa4b2; text-align: center;
+                  border-top: 1px solid #eef1f4; }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <div class="bank-header">Card Issuer &middot; Identity Verification</div>
+        <div class="body">
+          <h1>Verify your purchase</h1>
+          <p>We've sent a one-time passcode to the mobile number on file for this card. Enter it below to complete your purchase.</p>
+          <form method="POST" action="#{action}">
+            <input type="text" name="otp" inputmode="numeric" maxlength="6" placeholder="Enter OTP" autofocus required>
+            <button type="submit">Verify</button>
+          </form>
+          <div class="hint">Simulator: use code 123456 to approve, any other code to decline.</div>
+        </div>
+        <div class="footer">This is a simulated authentication screen for testing purposes.</div>
+      </div>
+    </body>
+    </html>
+    """
+  end
 
   defp random_id do
     :crypto.strong_rand_bytes(12) |> Base.url_encode64(padding: false)

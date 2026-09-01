@@ -14,11 +14,17 @@ defmodule MastercardSimulator.Router do
   Public routes (no auth):
     GET  /health
     GET  /static/checkout/checkout.min.js
+    GET  /static/checkout/session/:sid/context              (checkout.min.js AJAX)
     GET  /form/version/:v/merchant/:mid/session.js
     POST /form/version/:v/merchant/:mid/session/:sid/card   (session.js AJAX)
     POST /acs/:challenge_id[/verify]                        (3DS1 ACS challenge)
-    GET  /3ds2/challenge/:auth_id                           (3DS2 challenge page)
+    GET  /3ds2/challenge/:auth_id                           (3DS2 Hosted Checkout challenge page)
     POST /3ds2/challenge/:auth_id/verify
+    POST /3ds2/authenticate/:auth_id/verify                 (3DS2 Hosted Session AUTHENTICATE_PAYER OTP)
+
+  The PUT transaction route also accepts apiOperation INITIATE_AUTHENTICATION
+  and AUTHENTICATE_PAYER (3DS2 for Hosted Session — the merchant server drives
+  the challenge, not session.js).
   """
 
   use Plug.Router
@@ -127,27 +133,46 @@ defmodule MastercardSimulator.Router do
 
     store_session_3ds_context(session_id, body)
 
-    # Return successful session creation response
-    send_json(conn, 201, %{
-      "session" => %{
-        "id" => session_id,
-        "created" => DateTime.to_iso8601(DateTime.utc_now()),
-        "updated" => DateTime.to_iso8601(DateTime.utc_now()),
-        "validityPeriod" => 3600,
-        "merchant" => merchant_id
-      },
-      "result" => "SUCCESS",
-      "version" => "77"
-    })
+    if Map.get(body, "apiOperation") == "INITIATE_CHECKOUT" do
+      success_indicator = "SI_" <> (:crypto.strong_rand_bytes(6) |> Base.url_encode64(padding: false))
+      store_checkout_context(session_id, body, success_indicator, merchant_id)
+
+      send_json(conn, 201, %{
+        "session" => %{
+          "id" => session_id,
+          "created" => DateTime.to_iso8601(DateTime.utc_now()),
+          "updated" => DateTime.to_iso8601(DateTime.utc_now()),
+          "validityPeriod" => 3600,
+          "merchant" => merchant_id
+        },
+        "successIndicator" => success_indicator,
+        "result" => "SUCCESS",
+        "version" => "77"
+      })
+    else
+      # Return successful session creation response
+      send_json(conn, 201, %{
+        "session" => %{
+          "id" => session_id,
+          "created" => DateTime.to_iso8601(DateTime.utc_now()),
+          "updated" => DateTime.to_iso8601(DateTime.utc_now()),
+          "validityPeriod" => 3600,
+          "merchant" => merchant_id
+        },
+        "result" => "SUCCESS",
+        "version" => "77"
+      })
+    end
   end
 
   # PUT  /api/rest/version/:api_version/merchant/:merchant_id/session/:session_id
-  put "/api/rest/version/:_api_version/merchant/:_merchant_id/session/:session_id" do
+  put "/api/rest/version/:_api_version/merchant/:merchant_id/session/:session_id" do
     body = conn.body_params || %{}
 
     Logger.info("Session update request for session: #{session_id}, body: #{inspect(body)}")
 
     store_session_3ds_context(session_id, body)
+    store_checkout_context(session_id, body, nil, merchant_id)
 
     send_json(conn, 200, %{
       "result" => "SUCCESS",
@@ -156,6 +181,71 @@ defmodule MastercardSimulator.Router do
         "version" => "1"
       }
     })
+  end
+
+  # GET /static/checkout/session/:session_id/context — checkout.min.js's own
+  # AJAX call to fetch the returnUrl/successIndicator recorded at
+  # INITIATE_CHECKOUT time, so it knows where to send the browser back to.
+  get "/static/checkout/session/:session_id/context" do
+    context =
+      case ThreeDSStore.get("session:" <> session_id) do
+        {:ok, data} -> data
+        {:error, :not_found} -> %{}
+      end
+
+    send_json(conn, 200, %{
+      "returnUrl"        => Map.get(context, :return_url),
+      "successIndicator" => Map.get(context, :success_indicator),
+      "merchantName"     => Map.get(context, :merchant_name),
+      "merchantLogo"     => Map.get(context, :merchant_logo),
+      "amount"           => Map.get(context, :amount),
+      "currency"         => Map.get(context, :currency)
+    })
+  end
+
+  # POST /static/checkout/session/:session_id/complete — checkout.min.js
+  # calls this when the payer clicks Pay, so the simulator actually creates
+  # a transaction record for the order server-side (same PAY logic and test
+  # PAN scheme as the REST API), before redirecting the browser back with
+  # resultIndicator. Without this, the order the merchant looks up via
+  # GET .../order/:order_id would have no transaction at all — indistinguishable
+  # from a payment that never went through the gateway.
+  post "/static/checkout/session/:session_id/complete" do
+    card = conn.body_params || %{}
+    pan  = Map.get(card, "number", "")
+
+    context = fetch_session_context(session_id)
+    order_id    = Map.get(context, :order_id)
+    merchant_id = Map.get(context, :merchant_id)
+
+    cond do
+      is_nil(order_id) or is_nil(merchant_id) ->
+        send_json(conn, 422, %{
+          "status"  => "error",
+          "message" => "No order/merchant recorded for this checkout session"
+        })
+
+      ThreeDSEngine.enrolled?(pan) ->
+        auth_id = "AUTH_" <> (:crypto.strong_rand_bytes(9) |> Base.url_encode64(padding: false))
+        ThreeDSStore.put("auth:" <> auth_id, %{kind: :checkout, session_id: session_id, card: card})
+
+        send_json(conn, 200, %{
+          "status"       => "challenge_required",
+          "challengeUrl" => "#{base_url(conn)}/3ds2/challenge/#{auth_id}"
+        })
+
+      true ->
+        case run_checkout_payment(order_id, merchant_id, context, card, base_url(conn)) do
+          {:approved, _response} ->
+            send_json(conn, 200, %{"status" => "approved"})
+
+          {:declined, response} ->
+            send_json(conn, 200, %{
+              "status"  => "declined",
+              "message" => get_in(response, ["response", "acquirerMessage"])
+            })
+        end
+    end
   end
 
   # POST /api/rest/version/:api_version/merchant/:merchant_id/3DSecureId/:three_ds_id
@@ -204,28 +294,16 @@ defmodule MastercardSimulator.Router do
 
   # POST /form/version/:v/merchant/:mid/session/:session_id/card
   # session.js's own AJAX call, made when the cardholder submits the form.
+  # Hosted Session: this ONLY tokenises the card into the session. 3DS is
+  # driven afterwards by the merchant server via INITIATE_AUTHENTICATION /
+  # AUTHENTICATE_PAYER on the order transaction — session.js never runs the
+  # challenge and never redirects in this flow.
   post "/form/version/:_api_version/merchant/:_merchant_id/session/:session_id/card" do
     card = conn.body_params || %{}
-    pan  = Map.get(card, "number", "")
 
-    if ThreeDSEngine.enrolled?(pan) do
-      auth_id = "AUTH_" <> (:crypto.strong_rand_bytes(9) |> Base.url_encode64(padding: false))
+    ThreeDSStore.merge("session:" <> session_id, %{card: card})
 
-      response_url =
-        case ThreeDSStore.get("session:" <> session_id) do
-          {:ok, %{response_url: url}} -> url
-          _ -> nil
-        end
-
-      ThreeDSStore.put("auth:" <> auth_id, %{session_id: session_id, response_url: response_url})
-
-      send_json(conn, 200, %{
-        "status"       => "challenge_required",
-        "challengeUrl" => "#{base_url(conn)}/3ds2/challenge/#{auth_id}"
-      })
-    else
-      send_json(conn, 200, %{"status" => "ok"})
-    end
+    send_json(conn, 200, %{"status" => "ok"})
   end
 
   # GET /3ds2/challenge/:auth_id — the actual "OTP page" the payer sees,
@@ -235,29 +313,44 @@ defmodule MastercardSimulator.Router do
   end
 
   # POST /3ds2/challenge/:auth_id/verify — on success/failure, redirects the
-  # TOP-LEVEL browser window back to CloudLayer's response_url, same as a
-  # real 3DS2 challenge breaking out of its iframe at the end of the flow.
+  # TOP-LEVEL browser window back to the merchant, same as a real 3DS2
+  # challenge breaking out of its iframe at the end of the flow. Behavior
+  # branches on which flow started the challenge (stored on the auth
+  # record): Hosted Session redirects with response_gatewayRecommendation
+  # and leaves PAY/AUTHORIZE to the merchant's own later REST call; Hosted
+  # Checkout actually completes the order here (same as
+  # /static/checkout/session/:id/complete's non-3DS path) before redirecting
+  # with resultIndicator, since Checkout.js never gives the merchant a
+  # separate chance to call PAY themselves.
   post "/3ds2/challenge/:auth_id/verify" do
     otp = Map.get(conn.body_params || %{}, "otp", "")
     outcome = if ThreeDSEngine.valid_otp?(otp), do: :pass, else: :fail
 
-    response_url =
-      case ThreeDSStore.get("auth:" <> auth_id) do
-        {:ok, %{response_url: url}} -> url
-        _ -> nil
-      end
+    case ThreeDSStore.get("auth:" <> auth_id) do
+      {:ok, %{kind: :checkout} = auth} ->
+        send_html(conn, checkout_challenge_result_html(auth, outcome, base_url(conn)))
 
-    recommendation = if outcome == :pass, do: "PROCEED", else: "DO_NOT_PROCEED"
+      {:ok, auth} ->
+        send_html(conn, session_challenge_result_html(auth_id, auth, outcome))
 
-    if response_url do
-      target =
-        response_url <>
-          if(String.contains?(response_url, "?"), do: "&", else: "?") <>
-          "response_gatewayRecommendation=#{recommendation}&authenticationTransactionId=#{auth_id}"
+      {:error, :not_found} ->
+        send_html(conn, no_response_url_html(if(outcome == :pass, do: "PROCEED", else: "DO_NOT_PROCEED")))
+    end
+  end
 
-      send_html(conn, redirect_top_html(target))
-    else
-      send_html(conn, no_response_url_html(recommendation))
+  # ── 3DS2 Hosted Session AUTHENTICATE_PAYER challenge (no auth — browser) ─────
+
+  # POST /3ds2/authenticate/:auth_id/verify — the OTP form inside the
+  # AUTHENTICATE_PAYER redirectHtml posts here. On completion the simulator
+  # navigates the payer's browser back to the merchant's redirectResponseUrl
+  # with response_gatewayRecommendation appended (PROCEED / DO_NOT_PROCEED).
+  # The merchant server then calls PAY/AUTHORIZE on the same order.
+  post "/3ds2/authenticate/:auth_id/verify" do
+    otp = Map.get(conn.body_params || %{}, "otp", "")
+
+    case TransactionHandler.complete_authenticate_payer(auth_id, otp) do
+      {:ok, target_url}    -> send_html(conn, redirect_top_html(target_url))
+      {:error, :not_found} -> send_html(conn, no_response_url_html("DO_NOT_PROCEED"))
     end
   end
 
@@ -338,6 +431,139 @@ defmodule MastercardSimulator.Router do
     case Map.get(body, "response_url") do
       nil -> :ok
       response_url -> ThreeDSStore.merge("session:" <> session_id, %{response_url: response_url})
+    end
+  end
+
+  # Record Hosted Checkout context (interaction.returnUrl, successIndicator,
+  # interaction.merchant.name/logo, order.id/amount/currency, merchant_id)
+  # against the session, so /static/checkout/session/:id/context (fetched by
+  # checkout.min.js in the browser) can hand back what it needs to render the
+  # branded payment UI and to actually complete the order server-side (see
+  # /static/checkout/session/:id/complete) before redirecting back to the
+  # merchant. success_indicator is only generated at INITIATE_CHECKOUT time —
+  # pass nil on later session updates to leave whatever was already stored
+  # untouched.
+  defp store_checkout_context(session_id, body, success_indicator, merchant_id) do
+    return_url    = get_in(body, ["interaction", "returnUrl"])
+    merchant_name = get_in(body, ["interaction", "merchant", "name"])
+    merchant_logo = get_in(body, ["interaction", "merchant", "logo"])
+    order         = Map.get(body, "order", %{})
+
+    changes =
+      %{}
+      |> maybe_put(:return_url, return_url)
+      |> maybe_put(:success_indicator, success_indicator)
+      |> maybe_put(:merchant_name, merchant_name)
+      |> maybe_put(:merchant_logo, merchant_logo)
+      |> maybe_put(:amount, Map.get(order, "amount"))
+      |> maybe_put(:currency, Map.get(order, "currency"))
+      |> maybe_put(:order_id, Map.get(order, "id"))
+      |> maybe_put(:merchant_id, merchant_id)
+
+    if map_size(changes) > 0 do
+      ThreeDSStore.merge("session:" <> session_id, changes)
+    end
+  end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp fetch_session_context(session_id) do
+    case ThreeDSStore.get("session:" <> session_id) do
+      {:ok, data} -> data
+      {:error, :not_found} -> %{}
+    end
+  end
+
+  # Runs a Hosted Checkout order through the same PAY logic (and test-PAN
+  # scheme) as the REST API, given the session's recorded order context and
+  # the card entered in the checkout UI. Used both by the non-3DS path in
+  # /static/checkout/session/:id/complete and by the post-OTP completion in
+  # checkout_challenge_result_html/3.
+  defp run_checkout_payment(order_id, merchant_id, context, card, base_url) do
+    transaction_id = "TXN_" <> (:crypto.strong_rand_bytes(6) |> Base.url_encode64(padding: false))
+
+    pay_body = %{
+      "apiOperation" => "PAY",
+      "order" => %{
+        "amount"   => Map.get(context, :amount),
+        "currency" => Map.get(context, :currency)
+      },
+      "sourceOfFunds" => %{
+        "provided" => %{
+          "card" => %{
+            "number" => Map.get(card, "number"),
+            "expiry" => %{
+              "month" => Map.get(card, "expiryMonth"),
+              "year"  => Map.get(card, "expiryYear")
+            }
+          }
+        }
+      }
+    }
+
+    {:ok, _status, response} =
+      TransactionHandler.handle(merchant_id, order_id, transaction_id, pay_body, base_url)
+
+    case response["result"] do
+      "SUCCESS" -> {:approved, response}
+      _ -> {:declined, response}
+    end
+  end
+
+  defp append_query(url, kv) do
+    url <> if(String.contains?(url, "?"), do: "&", else: "?") <> kv
+  end
+
+  # Hosted Session's post-challenge redirect: report the recommendation and
+  # let the merchant's own subsequent REST call actually run PAY/AUTHORIZE.
+  defp session_challenge_result_html(auth_id, auth, outcome) do
+    response_url = Map.get(auth, :response_url)
+    recommendation = if outcome == :pass, do: "PROCEED", else: "DO_NOT_PROCEED"
+
+    if response_url do
+      target = append_query(response_url, "response_gatewayRecommendation=#{recommendation}&authenticationTransactionId=#{auth_id}")
+      redirect_top_html(target)
+    else
+      no_response_url_html(recommendation)
+    end
+  end
+
+  # Hosted Checkout's post-challenge redirect: Checkout.js never gives the
+  # merchant a separate chance to call PAY, so a passed OTP actually
+  # completes the order here before redirecting with resultIndicator. A
+  # failed OTP skips completion entirely — no transaction is created, and no
+  # resultIndicator is returned, so the merchant's comparison fails closed.
+  defp checkout_challenge_result_html(auth, :fail, _base_url) do
+    context = fetch_session_context(Map.get(auth, :session_id))
+
+    case Map.get(context, :return_url) do
+      nil -> no_response_url_html("DO_NOT_PROCEED")
+      return_url -> redirect_top_html(append_query(return_url, "resultIndicator="))
+    end
+  end
+
+  defp checkout_challenge_result_html(auth, :pass, base_url) do
+    session_id = Map.get(auth, :session_id)
+    card       = Map.get(auth, :card, %{})
+    context    = fetch_session_context(session_id)
+
+    order_id          = Map.get(context, :order_id)
+    merchant_id       = Map.get(context, :merchant_id)
+    return_url        = Map.get(context, :return_url)
+    success_indicator = Map.get(context, :success_indicator)
+
+    result_indicator =
+      if order_id && merchant_id do
+        case run_checkout_payment(order_id, merchant_id, context, card, base_url) do
+          {:approved, _response} -> success_indicator
+          {:declined, _response} -> nil
+        end
+      end
+
+    case return_url do
+      nil -> no_response_url_html(if(result_indicator, do: "PROCEED", else: "DO_NOT_PROCEED"))
+      _ -> redirect_top_html(append_query(return_url, "resultIndicator=#{result_indicator}"))
     end
   end
 
@@ -457,6 +683,250 @@ defmodule MastercardSimulator.Router do
   defp checkout_js do
     """
     (function () {
+      var CURRENT_SCRIPT = document.currentScript;
+      var SCRIPT_SRC = CURRENT_SCRIPT ? CURRENT_SCRIPT.src : "";
+      var MARKER_IDX = SCRIPT_SRC.indexOf("/static/checkout/checkout.min.js");
+      var SCRIPT_ORIGIN = MARKER_IDX >= 0 ? SCRIPT_SRC.slice(0, MARKER_IDX) : "";
+
+      // Real MPGS invokes the merchant's own named callback functions (given
+      // as script-tag attributes) when the payer cancels or an error occurs.
+      var ERROR_FN_NAME = CURRENT_SCRIPT ? CURRENT_SCRIPT.getAttribute("data-error") : null;
+      var CANCEL_FN_NAME = CURRENT_SCRIPT ? CURRENT_SCRIPT.getAttribute("data-cancel") : null;
+
+      function fetchContext(sessionId) {
+        return fetch(SCRIPT_ORIGIN + "/static/checkout/session/" + sessionId + "/context")
+          .then(function (r) { return r.json(); });
+      }
+
+      function completeWithResult(returnUrl, successIndicator) {
+        if (!returnUrl) {
+          console.warn("[MPGS Simulator] Checkout: no returnUrl configured for this session (interaction.returnUrl)");
+          return;
+        }
+        var separator = returnUrl.indexOf("?") >= 0 ? "&" : "?";
+        window.location.href = returnUrl + separator + "resultIndicator=" + encodeURIComponent(successIndicator || "");
+      }
+
+      // Opens the 3DS challenge page in an overlay iframe — the actual OTP
+      // page the payer sees. That page completes the order and redirects
+      // the top-level window itself once verified, so nothing further
+      // happens here.
+      function openChallenge(url) {
+        var overlay = document.createElement("div");
+        overlay.style.cssText =
+          "position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.6);" +
+          "z-index:999999;display:flex;align-items:center;justify-content:center;";
+
+        var iframe = document.createElement("iframe");
+        iframe.src = url;
+        iframe.style.cssText =
+          "width:400px;height:520px;max-width:95%;max-height:95%;border:none;" +
+          "border-radius:12px;background:#fff;box-shadow:0 10px 40px rgba(0,0,0,.3);";
+
+        overlay.appendChild(iframe);
+        document.body.appendChild(overlay);
+      }
+
+      function triggerCancel() {
+        if (CANCEL_FN_NAME && typeof window[CANCEL_FN_NAME] === "function") {
+          window[CANCEL_FN_NAME]();
+        } else {
+          console.warn("[MPGS Simulator] Checkout: payer cancelled, but no data-cancel callback is configured");
+        }
+      }
+
+      function triggerError() {
+        if (ERROR_FN_NAME && typeof window[ERROR_FN_NAME] === "function") {
+          window[ERROR_FN_NAME]({ cause: "SIMULATOR_ERROR", explanation: "Simulated Checkout.js error for testing" });
+        } else {
+          console.warn("[MPGS Simulator] Checkout: simulated error, but no data-error callback is configured");
+        }
+      }
+
+      function escapeHtml(value) {
+        var div = document.createElement("div");
+        div.textContent = value == null ? "" : String(value);
+        return div.innerHTML;
+      }
+
+      function formatAmount(ctx) {
+        if (ctx.amount == null) return "";
+        return (ctx.currency ? ctx.currency + " " : "") + Number(ctx.amount).toFixed(2);
+      }
+
+      // Branding matches the Hosted Session card page (session_page/1 in
+      // mastercard_controller.ex) so both flows look consistent in local
+      // testing. Real Checkout.js only ever lets a merchant pass a
+      // name/logo — it never lets the merchant restyle the page itself —
+      // so this is the simulator's own presentation layer, not something
+      // driven by additional INITIATE_CHECKOUT parameters beyond
+      // interaction.merchant.name/logo and order.amount/currency.
+      function cardHtml(ctx) {
+        var logoHtml = ctx.merchantLogo
+          ? '<img src="' + escapeHtml(ctx.merchantLogo) + '" alt="" style="width:64px;height:64px;object-fit:contain;">'
+          : '<span style="font-size:28px;font-weight:700;color:#7f496c;">' +
+            escapeHtml((ctx.merchantName || "M").charAt(0).toUpperCase()) + "</span>";
+
+        var amountHtml = formatAmount(ctx)
+          ? '<div style="font-size:20px;font-weight:700;">Amount: ' + escapeHtml(formatAmount(ctx)) + "</div>"
+          : "";
+
+        return (
+          '<div style="max-width:380px;margin:0 auto;font-family:Arial,Helvetica,sans-serif;' +
+          'background:#fff;border-radius:14px;overflow:hidden;box-shadow:0 10px 30px rgba(0,0,0,.08);">' +
+            '<div style="background:linear-gradient(135deg,#ca355f 0%,#7f496c 100%);color:#fff;' +
+            'padding:28px 24px 24px;text-align:center;">' +
+              '<div style="width:88px;height:88px;margin:0 auto 14px;border-radius:999px;background:#fff;' +
+              'display:flex;align-items:center;justify-content:center;box-shadow:0 10px 24px rgba(30,18,42,.18);' +
+              'overflow:hidden;">' + logoHtml + "</div>" +
+              (ctx.merchantName ? '<div style="font-weight:600;margin-bottom:4px;">' + escapeHtml(ctx.merchantName) + "</div>" : "") +
+              amountHtml +
+            "</div>" +
+            '<div style="padding:24px;">' +
+              field_row("Card number", '<span id="mpgs-card-number" style="width:100%;height:100%;display:block;"></span>') +
+              '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">' +
+                "<div>" +
+                  field_row("Expiry (MM/YY)", '<span id="mpgs-expiry-date" style="width:100%;height:100%;display:block;"></span>') +
+                "</div>" +
+                "<div>" +
+                  field_row("CVV", '<span id="mpgs-security-code" style="width:100%;height:100%;display:block;"></span>') +
+                "</div>" +
+              "</div>" +
+              '<button type="button" data-mpgs-action="pay" style="width:100%;margin-top:20px;padding:14px;border:0;' +
+              'border-radius:10px;background:#121533;color:#fff;font-size:18px;font-weight:700;cursor:pointer;">Pay' +
+              (formatAmount(ctx) ? " " + escapeHtml(formatAmount(ctx)) : "") + "</button>" +
+              '<p id="mpgs-checkout-error" style="color:#dc2626;font-size:13px;text-align:center;margin:10px 0 0;min-height:16px;"></p>' +
+              '<div style="margin-top:12px;text-align:center;">' +
+                '<button type="button" data-mpgs-action="cancel" style="background:none;border:0;color:#6b7280;' +
+                'font-size:13px;cursor:pointer;text-decoration:underline;margin-right:16px;">Cancel</button>' +
+                '<button type="button" data-mpgs-action="error" style="background:none;border:0;color:#6b7280;' +
+                'font-size:13px;cursor:pointer;text-decoration:underline;">Simulate Error</button>' +
+              "</div>" +
+              '<p style="font-size:11px;color:#9aa4b2;text-align:center;margin-top:14px;">' +
+              "Simulator: Pay uses the same test-card outcomes as the REST API; Cancel/Simulate Error exercise data-cancel/data-error.</p>" +
+            "</div>" +
+          "</div>"
+        );
+      }
+
+      function field_row(labelText, innerHtml) {
+        return (
+          '<label style="display:block;font-size:12px;font-weight:700;color:#374151;text-transform:uppercase;' +
+          'letter-spacing:.5px;margin:14px 0 6px;">' + escapeHtml(labelText) + "</label>" +
+          field_box(innerHtml)
+        );
+      }
+
+      function field_box(innerHtml) {
+        return (
+          '<div style="width:100%;height:48px;padding:0 14px;border:1.8px solid #d1d5db;border-radius:10px;' +
+          'background:#fff;box-sizing:border-box;display:flex;align-items:center;">' + innerHtml + "</div>"
+        );
+      }
+
+      // Real Checkout.js is self-contained — it injects and owns its own
+      // card fields, it does not rely on a separately configured
+      // PaymentSession/session.js. This injects a real, typable <input>
+      // into each placeholder <span> the card markup renders.
+      var CHECKOUT_FIELD_SPECS = {
+        "mpgs-card-number":   { inputmode: "numeric", maxlength: 19, autocomplete: "cc-number" },
+        "mpgs-expiry-date":   { inputmode: "numeric", maxlength: 5,  autocomplete: "cc-exp", placeholder: "MM/YY" },
+        "mpgs-security-code": { inputmode: "numeric", maxlength: 4,  autocomplete: "cc-csc" }
+      };
+
+      function injectFields(container) {
+        var inputs = {};
+
+        Object.keys(CHECKOUT_FIELD_SPECS).forEach(function (id) {
+          var span = container.querySelector("#" + id);
+          if (!span) return;
+
+          var spec = CHECKOUT_FIELD_SPECS[id];
+          var input = document.createElement("input");
+          input.type = "text";
+          input.style.cssText = "border:none;outline:none;background:transparent;width:100%;height:100%;font-size:16px;";
+          if (spec.inputmode) input.setAttribute("inputmode", spec.inputmode);
+          if (spec.maxlength) input.setAttribute("maxlength", spec.maxlength);
+          if (spec.autocomplete) input.setAttribute("autocomplete", spec.autocomplete);
+          if (spec.placeholder) input.setAttribute("placeholder", spec.placeholder);
+
+          if (id === "mpgs-expiry-date") {
+            input.addEventListener("input", function () {
+              var digits = input.value.replace(/[^0-9]/g, "").slice(0, 4);
+              input.value = digits.length > 2 ? digits.slice(0, 2) + "/" + digits.slice(2) : digits;
+            });
+          }
+
+          span.appendChild(input);
+          inputs[id] = input;
+        });
+
+        return inputs;
+      }
+
+      function renderPaymentUi(container, sessionId) {
+        container.innerHTML = '<p style="font-family:Arial,Helvetica,sans-serif;text-align:center;color:#888;">Loading payment form&hellip;</p>';
+
+        fetchContext(sessionId).then(function (ctx) {
+          container.innerHTML = cardHtml(ctx);
+          var inputs = injectFields(container);
+          var errorEl = container.querySelector("#mpgs-checkout-error");
+          var payButton = container.querySelector('[data-mpgs-action="pay"]');
+
+          payButton.addEventListener("click", function () {
+            if (errorEl) errorEl.textContent = "";
+
+            var cardNumber = inputs["mpgs-card-number"] ? inputs["mpgs-card-number"].value.trim() : "";
+            if (!cardNumber) {
+              if (errorEl) errorEl.textContent = "Please enter a card number.";
+              return;
+            }
+
+            var expiryValue = inputs["mpgs-expiry-date"] ? inputs["mpgs-expiry-date"].value.trim() : "";
+            var expiryParts = expiryValue.split("/");
+            var securityCode = inputs["mpgs-security-code"] ? inputs["mpgs-security-code"].value.trim() : "";
+
+            payButton.disabled = true;
+
+            // Actually completes the order server-side (same test-card
+            // outcomes as the REST PAY endpoint) before redirecting, so the
+            // merchant's GET .../order/:order_id lookup finds a real,
+            // approved transaction instead of nothing.
+            fetch(SCRIPT_ORIGIN + "/static/checkout/session/" + sessionId + "/complete", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                number: cardNumber,
+                expiryMonth: expiryParts[0] || "",
+                expiryYear: expiryParts[1] || "",
+                securityCode: securityCode
+              })
+            })
+              .then(function (r) { return r.json(); })
+              .then(function (result) {
+                if (result.status === "challenge_required") {
+                  // The challenge page itself completes the order and
+                  // redirects the top-level window once the OTP is
+                  // verified — nothing further to do here.
+                  openChallenge(result.challengeUrl);
+                } else if (result.status === "approved") {
+                  completeWithResult(ctx.returnUrl, ctx.successIndicator);
+                } else {
+                  payButton.disabled = false;
+                  if (errorEl) errorEl.textContent = result.message || "Payment could not be processed.";
+                }
+              })
+              .catch(function (err) {
+                payButton.disabled = false;
+                console.error("[MPGS Simulator] Checkout: completion request failed", err);
+                if (errorEl) errorEl.textContent = "Payment could not be processed.";
+              });
+          });
+          container.querySelector('[data-mpgs-action="cancel"]').addEventListener("click", triggerCancel);
+          container.querySelector('[data-mpgs-action="error"]').addEventListener("click", triggerError);
+        });
+      }
+
       window.Checkout = {
         _config: null,
 
@@ -465,6 +935,13 @@ defmodule MastercardSimulator.Router do
           console.log("[MPGS Simulator] Checkout.configure", this._config);
         },
 
+        // Embeds the payment UI inline into the target element. Field
+        // containers are empty placeholder <span>s, not live inputs — an
+        // <input> nested inside another <input> (which is what happens if
+        // session.js injects into an id that's already an <input> here) is
+        // legal markup but never focusable/typable in a browser.
+        // PaymentSession.configure() (session.js) injects the real fillable
+        // fields into these containers if the integrating page also uses it.
         showEmbeddedPage: function (selector) {
           var el = document.querySelector(selector);
           if (!el) {
@@ -475,28 +952,23 @@ defmodule MastercardSimulator.Router do
           var sessionId =
             (this._config && this._config.session && this._config.session.id) || "UNKNOWN_SESSION";
 
-          // These are empty placeholder containers, not live inputs — an
-          // <input> nested inside another <input> (which is what happens if
-          // session.js injects into an id that's already an <input> here)
-          // is legal markup but never focusable/typable in a browser.
-          // PaymentSession.configure() (session.js) injects the real
-          // fillable fields into these containers, matching real MPGS,
-          // where Checkout renders the page shell and PaymentSession owns
-          // the fields.
-          el.innerHTML =
-            '<div style="border:1px solid #ccc;padding:16px;font-family:sans-serif;">' +
-            "<p><strong>MPGS Simulator &mdash; Embedded Payment Form</strong></p>" +
-            "<p>Session: " + sessionId + "</p>" +
-            '<label>Card Number <span id="mpgs-card-number"></span></label><br>' +
-            '<label>Expiry Month <span id="mpgs-expiry-month"></span></label>' +
-            '<label>Expiry Year <span id="mpgs-expiry-year"></span></label><br>' +
-            '<label>Expiry (MM/YY) <span id="mpgs-expiry-date"></span></label><br>' +
-            '<label>CVV <span id="mpgs-security-code"></span></label>' +
-            "</div>";
+          renderPaymentUi(el, sessionId);
         },
 
+        // Real MPGS fully navigates the browser away to a hosted payment
+        // page; the simulator takes over the current document body instead.
         showPaymentPage: function () {
+          var sessionId =
+            (this._config && this._config.session && this._config.session.id) || "UNKNOWN_SESSION";
+
           console.log("[MPGS Simulator] Checkout.showPaymentPage", this._config);
+
+          document.body.style.background = "#f0f4f8";
+          document.body.style.margin = "0";
+          document.body.style.padding = "40px 16px";
+          document.body.style.boxSizing = "border-box";
+
+          renderPaymentUi(document.body, sessionId);
         }
       };
     })();
@@ -578,7 +1050,6 @@ defmodule MastercardSimulator.Router do
         updateSessionFromForm: function (type) {
           console.log("[MPGS Simulator] PaymentSession.updateSessionFromForm", type);
 
-          var self = this;
           var callback =
             this._config && this._config.callbacks && this._config.callbacks.formSessionUpdate;
           if (typeof callback !== "function") return;
@@ -613,9 +1084,11 @@ defmodule MastercardSimulator.Router do
             SCRIPT_ORIGIN + "/form/version/" + API_VERSION + "/merchant/" + MERCHANT_ID +
             "/session/" + sessionId + "/card";
 
-          // Real MPGS attaches the card to the session server-side at this
-          // point (the merchant's backend never sees the PAN) — this is also
-          // where a 3DS2-enrolled card triggers the actual OTP challenge.
+          // Hosted Session: this call only tokenises the card into the
+          // session server-side (the merchant's backend never sees the PAN).
+          // It does NOT run 3DS — the merchant server drives that afterwards
+          // via the INITIATE_AUTHENTICATION / AUTHENTICATE_PAYER API. session.js
+          // in this flow never shows a challenge and never redirects.
           fetch(cardUpdateUrl, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -626,38 +1099,11 @@ defmodule MastercardSimulator.Router do
               securityCode: securityCode
             })
           })
-            .then(function (r) { return r.json(); })
-            .then(function (result) {
-              if (result && result.status === "challenge_required") {
-                self._openChallenge(result.challengeUrl);
-              } else {
-                callback({ status: "ok" });
-              }
-            })
+            .then(function () { callback({ status: "ok" }); })
             .catch(function (err) {
               console.error("[MPGS Simulator] session/:id/card request failed", err);
               callback({ status: "ok" });
             });
-        },
-
-        // Opens the 3DS2 challenge page in an overlay iframe — this is the
-        // actual OTP page the payer sees. The challenge page itself redirects
-        // the top-level window to the merchant's response_url when done, so
-        // there is nothing further for this function to do afterwards.
-        _openChallenge: function (url) {
-          var overlay = document.createElement("div");
-          overlay.style.cssText =
-            "position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.6);" +
-            "z-index:999999;display:flex;align-items:center;justify-content:center;";
-
-          var iframe = document.createElement("iframe");
-          iframe.src = url;
-          iframe.style.cssText =
-            "width:400px;height:520px;max-width:95%;max-height:95%;border:none;" +
-            "border-radius:12px;background:#fff;box-shadow:0 10px 40px rgba(0,0,0,.3);";
-
-          overlay.appendChild(iframe);
-          document.body.appendChild(overlay);
         }
       };
     })();

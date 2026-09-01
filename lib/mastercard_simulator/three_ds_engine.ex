@@ -7,6 +7,7 @@ defmodule MastercardSimulator.ThreeDSEngine do
   Test PAN matrix (first 8 digits)
   ──────────────────────────────────────────────────────────────────────────
   4000 0000 xxxx xxxx    NOT enrolled — frictionless, no challenge shown
+  5200 0000 xxxx xxxx    Enrolled — challenge shown, always returns non-PROCEED
   everything else        Enrolled — challenge required (default)
   ──────────────────────────────────────────────────────────────────────────
 
@@ -15,11 +16,21 @@ defmodule MastercardSimulator.ThreeDSEngine do
   """
 
   @frictionless_prefixes ["40000000"]
+  @challenge_decline_prefixes ["52000000"]
   @fixed_otp "123456"
 
   @doc "Whether this PAN requires a 3DS challenge (true) or is frictionless (false)."
   def enrolled?(pan) do
     not prefix_match?(clean_pan(pan), @frictionless_prefixes)
+  end
+
+  @doc """
+  Forced challenge outcome for certain test PANs, independent of the OTP
+  entered: `:fail` for the always-decline test card, otherwise `nil` (the
+  submitted OTP decides).
+  """
+  def forced_challenge_outcome(pan) do
+    if prefix_match?(clean_pan(pan), @challenge_decline_prefixes), do: :fail, else: nil
   end
 
   @doc "Whether a submitted OTP matches the fixed test code."
