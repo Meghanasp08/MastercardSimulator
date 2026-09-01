@@ -589,7 +589,7 @@ defmodule MastercardSimulator.Router do
       <title>Identity Verification</title>
       <style>
         body { font-family: Arial, Helvetica, sans-serif; background: #eef1f4; margin: 0; }
-        .card { max-width: 380px; margin: 40px auto; background: #fff; border-radius: 8px;
+        .card { max-width: 420px; margin: 40px auto; background: #fff; border-radius: 8px;
                 box-shadow: 0 4px 16px rgba(0,0,0,.15); overflow: hidden; }
         .bank-header { background: #003a70; color: #fff; padding: 16px 20px; font-size: 14px;
                        font-weight: 600; letter-spacing: .3px; }
@@ -772,11 +772,11 @@ defmodule MastercardSimulator.Router do
           : "";
 
         return (
-          '<div style="max-width:380px;margin:0 auto;font-family:Arial,Helvetica,sans-serif;' +
+          '<div style="max-width:520px;margin:0 auto;font-family:Arial,Helvetica,sans-serif;' +
           'background:#fff;border-radius:14px;overflow:hidden;box-shadow:0 10px 30px rgba(0,0,0,.08);">' +
             '<div style="background:linear-gradient(135deg,#ca355f 0%,#7f496c 100%);color:#fff;' +
-            'padding:28px 24px 24px;text-align:center;">' +
-              '<div style="width:88px;height:88px;margin:0 auto 14px;border-radius:999px;background:#fff;' +
+            'padding:24px 24px 20px;text-align:center;">' +
+              '<div style="width:72px;height:72px;margin:0 auto 10px;border-radius:999px;background:#fff;' +
               'display:flex;align-items:center;justify-content:center;box-shadow:0 10px 24px rgba(30,18,42,.18);' +
               'overflow:hidden;">' + logoHtml + "</div>" +
               (ctx.merchantName ? '<div style="font-weight:600;margin-bottom:4px;">' + escapeHtml(ctx.merchantName) + "</div>" : "") +
@@ -792,6 +792,7 @@ defmodule MastercardSimulator.Router do
                   field_row("CVV", '<span id="mpgs-security-code" style="width:100%;height:100%;display:block;"></span>') +
                 "</div>" +
               "</div>" +
+              field_row("Name on card", '<span id="mpgs-name-on-card" style="width:100%;height:100%;display:block;"></span>') +
               '<button type="button" data-mpgs-action="pay" style="width:100%;margin-top:20px;padding:14px;border:0;' +
               'border-radius:10px;background:#121533;color:#fff;font-size:18px;font-weight:700;cursor:pointer;">Pay' +
               (formatAmount(ctx) ? " " + escapeHtml(formatAmount(ctx)) : "") + "</button>" +
@@ -802,7 +803,7 @@ defmodule MastercardSimulator.Router do
                 '<button type="button" data-mpgs-action="error" style="background:none;border:0;color:#6b7280;' +
                 'font-size:13px;cursor:pointer;text-decoration:underline;">Simulate Error</button>' +
               "</div>" +
-              '<p style="font-size:11px;color:#9aa4b2;text-align:center;margin-top:14px;">' +
+              '<p style="font-size:11px;color:#9aa4b2;text-align:center;margin-top:12px;">' +
               "Simulator: Pay uses the same test-card outcomes as the REST API; Cancel/Simulate Error exercise data-cancel/data-error.</p>" +
             "</div>" +
           "</div>"
@@ -831,7 +832,8 @@ defmodule MastercardSimulator.Router do
       var CHECKOUT_FIELD_SPECS = {
         "mpgs-card-number":   { inputmode: "numeric", maxlength: 19, autocomplete: "cc-number" },
         "mpgs-expiry-date":   { inputmode: "numeric", maxlength: 5,  autocomplete: "cc-exp", placeholder: "MM/YY" },
-        "mpgs-security-code": { inputmode: "numeric", maxlength: 4,  autocomplete: "cc-csc" }
+        "mpgs-security-code": { inputmode: "numeric", maxlength: 4,  autocomplete: "cc-csc" },
+        "mpgs-name-on-card":  { maxlength: 80, autocomplete: "cc-name", placeholder: "Name on card" }
       };
 
       function injectFields(container) {
@@ -885,6 +887,7 @@ defmodule MastercardSimulator.Router do
             var expiryValue = inputs["mpgs-expiry-date"] ? inputs["mpgs-expiry-date"].value.trim() : "";
             var expiryParts = expiryValue.split("/");
             var securityCode = inputs["mpgs-security-code"] ? inputs["mpgs-security-code"].value.trim() : "";
+            var nameOnCard = inputs["mpgs-name-on-card"] ? inputs["mpgs-name-on-card"].value.trim() : "";
 
             payButton.disabled = true;
 
@@ -899,7 +902,8 @@ defmodule MastercardSimulator.Router do
                 number: cardNumber,
                 expiryMonth: expiryParts[0] || "",
                 expiryYear: expiryParts[1] || "",
-                securityCode: securityCode
+                securityCode: securityCode,
+                nameOnCard: nameOnCard
               })
             })
               .then(function (r) { return r.json(); })
