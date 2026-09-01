@@ -42,7 +42,20 @@ defmodule MastercardSimulator.AuthPlug do
 
   defp public_path?(path) do
     path in @public_paths or session_js_path?(path) or session_card_path?(path) or
-      acs_path?(path) or three_ds2_challenge_path?(path)
+      acs_path?(path) or three_ds2_challenge_path?(path) or three_ds2_authenticate_path?(path) or
+      checkout_context_path?(path)
+  end
+
+  # GET /static/checkout/session/:session_id/context — checkout.min.js's own
+  # browser-side AJAX call to fetch the returnUrl/successIndicator recorded
+  # at INITIATE_CHECKOUT time. POST .../complete is the same script
+  # completing the order server-side when the payer clicks Pay.
+  defp checkout_context_path?(path) do
+    case String.split(path, "/", trim: true) do
+      ["static", "checkout", "session", _session_id, "context"] -> true
+      ["static", "checkout", "session", _session_id, "complete"] -> true
+      _ -> false
+    end
   end
 
   # GET /form/version/:version/merchant/:merchant_id/session.js is loaded
@@ -80,6 +93,15 @@ defmodule MastercardSimulator.AuthPlug do
     case String.split(path, "/", trim: true) do
       ["3ds2", "challenge", _auth_id] -> true
       ["3ds2", "challenge", _auth_id, "verify"] -> true
+      _ -> false
+    end
+  end
+
+  # POST /3ds2/authenticate/:auth_id/verify — the OTP form embedded in the
+  # AUTHENTICATE_PAYER redirectHtml, submitted directly by the payer's browser.
+  defp three_ds2_authenticate_path?(path) do
+    case String.split(path, "/", trim: true) do
+      ["3ds2", "authenticate", _auth_id, "verify"] -> true
       _ -> false
     end
   end
